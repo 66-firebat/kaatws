@@ -1,0 +1,15 @@
+{
+  "name": "kaatws",
+  "version": "1.0.0",
+  "description": "Kando ALT+TAB Window Switcher — a standalone Node.js script that uses Kando's IPC pie menu to present a window switcher for Hyprland.",
+  "main": "kaatws.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node kaatws.js"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  },
+  "author": "",
+  "license": "MIT"
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "version 1",
+  "defaultApps": [
+    {
+      "name": "Firefox",
+      "command": "firefox"
+    },
+    {
+      "name": "com.mitchellh.ghostty",
+      "command": "com.mitchellh.ghostty"
+    },
+    {
+      "name": "blender",
+      "command": "blender"
+    },
+    {
+      "name": "discord",
+      "command": "discord"
+    }
+  ],
+  "hiddenWindows": [],
+  "iconTheme": "fireshark",
+  "iconThemeDirectory": "/home/fireshark/.config/kando/icon-themes",
+  "maxItems": 6,
+  "submenuThreshold": 2,
+  "truncationLimit": 30
+}
