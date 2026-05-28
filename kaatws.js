@@ -160,9 +160,6 @@ function executeItem(item, client, config) {
     }
     case 'show-overflow':
       return 'ignore';
-    case 'next-page':
-    case 'previous-page':
-      return 'navigate';
     default:
       if (data.action) console.error('✖ Unknown action:', data.action);
       break;
@@ -187,48 +184,56 @@ function buildPaginatedRoot(allEntries, currentPage, config, filterString, mainS
 
   const marked = displayEntries.map((entry, i) => {
     if (i === mainSelection) {
-      return { ...entry, icon: 'radio_button_checked', iconTheme: 'material-symbols-rounded' };
+      const sel = entry.icon.replace(/(\.[^.]+)$/, '_selected$1');
+      return { ...entry, icon: sel, iconTheme: config.iconTheme };
     }
     return entry;
   });
 
-  if (marked.length <= maxItems) {
+  // Show up to 6 items + add.svg overflow submenu if there are more.
+  const pageSize = maxItems - 1; // reserve last slot for add.svg if needed
+  if (marked.length > maxItems) {
+    const pageItems = marked.slice(0, pageSize);
+    const overflowItems = marked.slice(pageSize);
+    // Build recursive overflow submenu
+    function makeOverflow(items) {
+      if (items.length <= maxItems) return items.map((e, i) => ({ ...e, angle: i * 60 }));
+      const ov = items.slice(0, pageSize);
+      const rest = items.slice(pageSize);
+      ov.push({
+        type: 'submenu', name: '+' + rest.length, icon: 'add.svg',
+        iconTheme: config.iconTheme, angle: pageSize * 60,
+        data: { action: 'show-overflow' },
+        children: makeOverflow(rest),
+      });
+      return ov;
+    }
+    const overflowChildren = makeOverflow(overflowItems);
+    pageItems.push({
+      type: 'submenu', name: '+' + overflowItems.length, icon: 'add.svg',
+      iconTheme: config.iconTheme, angle: pageSize * 60,
+      data: { action: 'show-overflow' },
+      children: overflowChildren,
+    });
     return {
       type: 'simple-button', name: rootName, icon: 'gps_fixed', iconTheme: 'material-symbols-rounded',
-      children: assignAngles([...marked], maxItems),
+      children: assignAngles(pageItems, maxItems),
     };
-  }
-
-  const perPage = maxItems - 1;
-  const totalPages = Math.ceil(marked.length / perPage);
-  const hasPrev = currentPage > 0;
-  const hasNext = currentPage < totalPages - 1;
-  const start = currentPage * perPage;
-  let pageItems = marked.slice(start, start + perPage);
-
-  if (hasPrev) {
-    pageItems.unshift({
-      type: 'simple-button', name: '← Back', icon: 'arrow_back',
-      iconTheme: 'material-symbols-rounded', data: { action: 'previous-page' },
-    });
-  }
-  if (hasNext) {
-    pageItems.push({
-      type: 'simple-button', name: '→ Next', icon: 'arrow_forward',
-      iconTheme: 'material-symbols-rounded', data: { action: 'next-page' },
-    });
   }
 
   return {
     type: 'simple-button', name: rootName, icon: 'gps_fixed', iconTheme: 'material-symbols-rounded',
-    children: assignAngles(pageItems, maxItems),
+    children: assignAngles([...marked], maxItems),
   };
 }
 
 function buildSubmenuPage(submenuEntry, config, filterString, selection) {
   const children = (submenuEntry.children || []).map((child, i) => {
     const c = { ...child };
-    if (i === selection) { c.icon = 'radio_button_checked'; c.iconTheme = 'material-symbols-rounded'; }
+    if (i === selection) {
+      const sel = c.icon.replace(/(\.[^.]+)$/, '_selected$1');
+      c.icon = sel; c.iconTheme = config.iconTheme;
+    }
     return c;
   });
   const maxItems = config.maxItems;
@@ -276,14 +281,14 @@ async function main() {
   } catch {}
   console.log('✓ Focused:', focusedClass || '(unknown)');
 
-  let currentPage = 0, currentRoot = null, filterString = '';
+  let currentRoot = null, filterString = '';
   let mainSelection = 0, submenuExpanded = null, submenuSelection = 0;
 
   function sendCurrentPage(client) {
-    const root = buildPaginatedRoot(focusedFirstEntries, currentPage, config, filterString, mainSelection);
+    const root = buildPaginatedRoot(focusedFirstEntries, 0, config, filterString, mainSelection);
     const count = root.children ? root.children.length : 0;
     const info = filterString ? ' filter="' + filterString + '"' : '';
-    console.log('  Page %d: %d item(s)%s', currentPage + 1, count, info);
+    console.log('  Menu: %d item(s)%s', count, info);
     client.showMenu(root);
     return root;
   }
@@ -317,11 +322,7 @@ async function main() {
     if (ev.target !== 'item') return;
     const item = lookupItemByPath(currentRoot, ev.path);
     if (!item) { console.error('✖ No item at path %j', ev.path); return; }
-    const result = executeItem(item, client, config);
-    if (result === 'navigate') {
-      currentPage += item.data.action === 'next-page' ? 1 : -1;
-      currentRoot = sendCurrentPage(client);
-    }
+    executeItem(item, client, config);
   });
 
   let cancelled = false;
@@ -381,18 +382,13 @@ async function main() {
         }
       }
 
-    } else if (ev.name === 'l' && ev.ctrl && !submenuExpanded) {
-      const display = getFiltered(focusedFirstEntries, filterString);
-      const perPage = config.maxItems - 1;
-      const totalPages = Math.ceil(display.length / perPage);
-      if (currentPage < totalPages - 1) { currentPage++; menuChanged = true; }
     } else if (ev.name === 'h' && ev.ctrl) {
-      if (submenuExpanded) { submenuExpanded = null; submenuSelection = 0; filterString = ''; currentPage = 0; menuChanged = true; }
-      else if (currentPage > 0) { currentPage--; menuChanged = true; }
+      if (submenuExpanded) { submenuExpanded = null; submenuSelection = 0; filterString = ''; mainSelection = 0; menuChanged = true; }
     } else if (ev.name === 'BACKSPACE') {
-      if (filterString.length > 0) { filterString = filterString.slice(0, -1); currentPage = 0; mainSelection = 0; menuChanged = true; }
-    } else if (ev.alt && ev.character && /^[1-6]$/.test(ev.character)) {
-      // Alt+1..6 — select item at position, must come BEFORE letter key filter
+      if (filterString.length > 0) { filterString = filterString.slice(0, -1); mainSelection = 0; menuChanged = true; }
+    } else if (ev.character && /^[1-6]$/.test(ev.character)) {
+      // 1..6 — select item at position (ALT isn't detected because ALT events
+      // don't reach the keyd virtual keyboard). Must come BEFORE letter key filter.
       const pos = parseInt(ev.character) - 1;
       if (submenuExpanded) {
         const children = submenuExpanded.entry.children || [];
@@ -427,7 +423,7 @@ async function main() {
       }
       return;
     } else if (ev.character && /^[a-zA-Z0-9 ]$/.test(ev.character)) {
-      filterString += ev.character.toLowerCase(); currentPage = 0; mainSelection = 0; menuChanged = true;
+      filterString += ev.character.toLowerCase(); mainSelection = 0; menuChanged = true;
 
     } else if (ev.name === 'ENTER' && !ev.ctrl) {
       if (submenuExpanded) {
