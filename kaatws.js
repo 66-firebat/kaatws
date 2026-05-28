@@ -240,8 +240,8 @@ function buildSubmenuPage(submenuEntry, config, filterString, selection) {
   const selName = children[selection]?.name || '';
   const center = truncate(selName, 35) + '  (' + (selection + 1) + '/' + children.length + ')';
   return {
-    type: 'simple-button', name: center, icon: 'gps_fixed', iconTheme: 'material-symbols-rounded',
-    iconTheme: config.iconTheme, children: assignAngles(children, maxItems),
+    type: 'simple-button', name: center, icon: 'left_arrow.svg', iconTheme: config.iconTheme,
+    children: assignAngles(children, maxItems),
   };
 }
 
