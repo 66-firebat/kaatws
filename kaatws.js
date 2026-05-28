@@ -20,6 +20,31 @@ function resolveIcon(cls, config) {
   return cls;
 }
 
+/** Build a recursive overflow page with up to 6 items + add.svg if more. */
+function buildOverflowPage(windows, config, truncationLimit, icon) {
+  const page = windows.slice(0, 6);
+  const remaining = windows.length - page.length;
+  const children = page.map((win, i) => ({
+    type: 'simple-button',
+    name: truncate(win.title, truncationLimit),
+    icon, iconTheme: config.iconTheme,
+    angle: i * 60,
+    data: { address: win.address, class: win.class, action: 'focus' },
+  }));
+  if (remaining > 0) {
+    const nextOverflow = buildOverflowPage(windows.slice(6), config, truncationLimit, icon);
+    children.push({
+      type: 'submenu',
+      name: '+' + remaining,
+      icon: 'add.svg', iconTheme: config.iconTheme,
+      angle: children.length * 60,
+      data: { action: 'show-overflow' },
+      children: nextOverflow,
+    });
+  }
+  return children;
+}
+
 function collectAllEntries(config, appGroups) {
   const { truncationLimit, defaultApps, submenuThreshold } = config;
   const entries = [];
@@ -27,12 +52,29 @@ function collectAllEntries(config, appGroups) {
     const icon = resolveIcon(group.class, config);
     const truncatedName = truncate(group.class, truncationLimit);
     if (group.count >= submenuThreshold) {
-      const children = group.windows.map((win) => ({
+      // Build submenu preview children (max 5 + optional +N indicator)
+      // Fixed angles at 0°, 60°, 120°, 180°, 240° align with 60° spacing
+      // and account for Kando's parent gap logic (all items have fixed angles).
+      const previewWindows = group.windows.slice(0, 5);
+      const remaining = group.windows.length - previewWindows.length;
+      const children = previewWindows.map((win, i) => ({
         type: 'simple-button',
         name: truncate(win.title, truncationLimit),
         icon, iconTheme: config.iconTheme,
+        angle: i * 60,
         data: { address: win.address, class: win.class, action: 'focus' },
       }));
+      if (remaining > 0) {
+        const overflowChildren = buildOverflowPage(group.windows.slice(5), config, truncationLimit, icon);
+        children.push({
+          type: 'submenu',
+          name: '+' + remaining,
+          icon: 'add.svg', iconTheme: config.iconTheme,
+          angle: 5 * 60,
+          data: { class: group.class, action: 'show-overflow' },
+          children: overflowChildren,
+        });
+      }
       entries.push({
         type: 'submenu', name: truncatedName, icon,
         iconTheme: config.iconTheme,
@@ -70,9 +112,15 @@ function centerName(filterString) {
   return filterString || '';
 }
 
+const QUICK_KEYS = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6'];
+
 function assignAngles(items, maxItems) {
   const step = 360 / maxItems;
-  return items.map((item, i) => ({ ...item, angle: i * step }));
+  return items.map((item, i) => ({
+    ...item,
+    angle: i * step,
+    quickSelectKey: i < QUICK_KEYS.length ? QUICK_KEYS[i] : undefined,
+  }));
 }
 
 function truncate(str, maxLen) {
@@ -110,6 +158,8 @@ function executeItem(item, client, config) {
       exec('nohup ' + command + ' > /dev/null 2>&1 &', { detached: true });
       break;
     }
+    case 'show-overflow':
+      return 'ignore';
     case 'next-page':
     case 'previous-page':
       return 'navigate';
@@ -247,6 +297,23 @@ async function main() {
     const key = ev.target + ':' + ev.path.join(',');
     if (key === lastSelectKey) return;
     lastSelectKey = key;
+
+    // Track submenu expansion so Enter works after clicking into a submenu.
+    if (ev.target === 'submenu' && currentRoot?.children) {
+      const subIdx = ev.path[0];
+      const subEntry = currentRoot.children[subIdx];
+      if (subEntry?.children) {
+        submenuExpanded = { entry: subEntry, parentRoot: currentRoot };
+        submenuSelection = 0;
+      }
+      return;
+    }
+    if (ev.target === 'parent') {
+      submenuExpanded = null;
+      submenuSelection = 0;
+      return;
+    }
+
     if (ev.target !== 'item') return;
     const item = lookupItemByPath(currentRoot, ev.path);
     if (!item) { console.error('✖ No item at path %j', ev.path); return; }
@@ -324,6 +391,41 @@ async function main() {
       else if (currentPage > 0) { currentPage--; menuChanged = true; }
     } else if (ev.name === 'BACKSPACE') {
       if (filterString.length > 0) { filterString = filterString.slice(0, -1); currentPage = 0; mainSelection = 0; menuChanged = true; }
+    } else if (ev.alt && ev.character && /^[1-6]$/.test(ev.character)) {
+      // Alt+1..6 — select item at position, must come BEFORE letter key filter
+      const pos = parseInt(ev.character) - 1;
+      if (submenuExpanded) {
+        const children = submenuExpanded.entry.children || [];
+        const target = children[pos];
+        if (target) {
+          if (target.type === 'submenu') {
+            console.log('→ Alt+%d — expanding nested %s', pos + 1, target.name);
+            submenuExpanded = { entry: target, parentRoot: currentRoot };
+            submenuSelection = 0;
+            currentRoot = buildSubmenuPage(target, config, filterString, 0);
+            client.showMenu(currentRoot);
+          } else {
+            console.log('→ Alt+%d — focusing %s', pos + 1, target.name);
+            executeItem(target, client, config); return;
+          }
+        }
+      } else {
+        const filtered = getFiltered(focusedFirstEntries, filterString);
+        const target = filtered[pos];
+        if (target) {
+          if (target.type === 'submenu') {
+            console.log('→ Alt+%d — expanding %s', pos + 1, target.name);
+            submenuExpanded = { entry: target, parentRoot: currentRoot };
+            submenuSelection = 0;
+            currentRoot = buildSubmenuPage(target, config, filterString, 0);
+            client.showMenu(currentRoot);
+          } else {
+            console.log('→ Alt+%d — executing %s', pos + 1, target.name);
+            executeItem(target, client, config); return;
+          }
+        }
+      }
+      return;
     } else if (ev.character && /^[a-zA-Z0-9 ]$/.test(ev.character)) {
       filterString += ev.character.toLowerCase(); currentPage = 0; mainSelection = 0; menuChanged = true;
 
@@ -331,7 +433,18 @@ async function main() {
       if (submenuExpanded) {
         const children = submenuExpanded.entry.children || [];
         const target = children[submenuSelection];
-        if (target) { console.log('→ Enter — focusing %s', target.name); executeItem(target, client, config); return; }
+        if (target) {
+          if (target.type === 'submenu') {
+            // Expand nested submenu (e.g. add.svg overflow)
+            console.log('→ Enter — expanding nested %s', target.name);
+            submenuExpanded = { entry: target, parentRoot: currentRoot };
+            submenuSelection = 0;
+            currentRoot = buildSubmenuPage(target, config, filterString, 0);
+            client.showMenu(currentRoot);
+          } else {
+            console.log('→ Enter — focusing %s', target.name); executeItem(target, client, config); return;
+          }
+        }
       } else {
         const filtered = getFiltered(focusedFirstEntries, filterString);
         if (filtered.length > 0) {
