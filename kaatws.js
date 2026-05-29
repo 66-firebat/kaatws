@@ -400,9 +400,8 @@ async function main() {
     const items = [];
     for (const child of (children || [])) {
       if (child.type === 'submenu' && child.icon === 'add.svg') {
-        // Recursively collect from overflow submenu
         items.push(...collectAllWindows(child.children, entryName));
-      } else {
+      } else if (child.data?.action === 'focus') {
         items.push({ text: (entryName || '') + ' ' + (child.name || ''), entry: child, parent: null });
       }
     }
@@ -419,7 +418,6 @@ async function main() {
     } else {
       for (const entry of focusedFirstEntries) {
         items.push({ text: entry.name, entry, parent: null });
-        // Recursively collect ALL windows including overflow
         const allWins = collectAllWindows(entry.children, entry.name);
         items.push(...allWins);
       }
@@ -597,6 +595,28 @@ async function main() {
       if (submenuExpanded) { submenuExpanded = null; submenuSelection = 0; filterString = ''; mainSelection = 0; menuChanged = true; }
     } else if (ev.name === 'BACKSPACE') {
       if (filterString.length > 0) { filterString = filterString.slice(0, -1); mainSelection = 0; menuChanged = true; }
+    } else if (/^F[1-6]$/.test(ev.name)) {
+      // F1-F6 — select and execute item at that position
+      const fIdx = parseInt(ev.name[1]) - 1;
+      let fItem = null;
+      if (submenuExpanded) {
+        fItem = (submenuExpanded.entry.children || [])[fIdx];
+      } else {
+        const fFiltered = getFiltered(focusedFirstEntries, filterString, fuzzyMode, lastFuzzyItems);
+        fItem = fFiltered[fIdx];
+      }
+      if (fItem) {
+        if (fItem.type === 'submenu') {
+          console.log('→ F%d — expanding %s', fIdx + 1, fItem.name);
+          submenuExpanded = { entry: fItem, parentRoot: currentRoot, overflowClass: fItem.data?.class || fItem.name, overflowDepth: 0 };
+          submenuSelection = 0;
+          currentRoot = buildSubmenuPage(fItem, config, filterString, 0);
+          client.showMenu(currentRoot);
+        } else {
+          console.log('→ F%d — executing %s', fIdx + 1, fItem.name);
+          executeItem(fItem, client, config); return;
+        }
+      }
     } else if (ev.name === 'c') {
       if (!ev.ctrl) { filterString += 'c'; mainSelection = 0; menuChanged = true; }
       else {
@@ -613,64 +633,83 @@ async function main() {
           execSync("hyprctl dispatch 'hl.dsp.window.close({ window = \"address:" + target.data.address + "\" })'", { timeout: 3000 });
           console.log('→ Closed %s', target.name);
         } catch (err) { console.error('✖ Close failed:', err.message); }
-        // Regenerate the menu (same selection index)
-        if (submenuExpanded) {
-          submenuExpanded.entry.children = (submenuExpanded.entry.children || []).filter(
-            c => c.data?.address !== target.data?.address
-          );
-          currentRoot = buildSubmenuPage(submenuExpanded.entry, config, filterString, Math.min(submenuSelection, (submenuExpanded.entry.children?.length || 1) - 1));
-          client.showMenu(currentRoot);
-        } else {
-          // Remove the closed item from the data and regenerate
-          const closedAddr = target.data.address;
-          focusedFirstEntries = focusedFirstEntries.filter(e => e.data?.address !== closedAddr);
-          mainSelection = Math.min(mainSelection, focusedFirstEntries.length - 1);
-          if (focusedFirstEntries.length > 0) {
-            currentRoot = sendCurrentPage(client);
-          } else {
-            currentRoot = sendCurrentPage(client);
+        // Poll until the window is actually gone, then refresh
+        const closedAddr = target.data.address;
+        let attempts = 0;
+        const pollAndRefresh = () => {
+          attempts++;
+          try {
+            const clients = JSON.parse(execSync('hyprctl clients -j', { timeout: 3000, encoding: 'utf-8' }));
+            const stillExists = clients.some(c => c.address === closedAddr);
+            if (!stillExists) {
+              // Window is gone — refresh data and rebuild menu
+              try {
+                const newResult = collectWindows(config.hiddenWindows);
+                const newEntries = collectAllEntries(config, newResult.appGroups);
+                let newFocused = newEntries;
+                if (focusedClass) {
+                  const lc = focusedClass.toLowerCase();
+                  const idx = newEntries.findIndex(e => e.name.toLowerCase() === lc);
+                  if (idx > 0) newFocused = [newEntries[idx], ...newEntries.slice(0, idx), ...newEntries.slice(idx + 1)];
+                }
+                focusedFirstEntries = newFocused;
+                allEntries = newEntries;
+              } catch {}
+              // Find refreshed entry — try data.class first, then name
+              let targetClass = submenuExpanded?.overflowClass || '';
+              let entry = allEntries.find(e =>
+                e.data?.class && e.data.class.toLowerCase() === targetClass.toLowerCase()
+              ) || allEntries.find(e => e.name.toLowerCase() === targetClass.toLowerCase());
+              if (entry && submenuExpanded?.overflowDepth > 0) {
+                for (let d = 0; d < submenuExpanded.overflowDepth; d++) {
+                  const addSvg = (entry.children || []).find(c => c.type === 'submenu' && c.icon === 'add.svg');
+                  if (addSvg) entry = addSvg; else break;
+                }
+              }
+              if (entry && (!entry.children || entry.children.length === 0)) {
+                // No children left — exit submenu back to main menu
+                submenuExpanded = null;
+                submenuSelection = 0;
+                currentRoot = sendCurrentPage(client);
+              } else if (entry && entry.children) {
+                submenuExpanded.entry = entry;
+                submenuSelection = Math.min(submenuSelection, entry.children.length - 1);
+                currentRoot = buildSubmenuPage(entry, config, filterString, submenuSelection);
+                client.showMenu(currentRoot);
+              } else {
+                // Entry not found or type changed — fall back to main menu
+                submenuExpanded = null;
+                submenuSelection = 0;
+                currentRoot = sendCurrentPage(client);
+              }
+              return;
+            }
+          } catch {}
+          if (attempts < 20) setTimeout(pollAndRefresh, 200); else doFallbackRefresh();
+        };
+        function doFallbackRefresh() {
+          if (submenuExpanded) {
+            const remaining = (submenuExpanded.entry.children || []).filter(c => c.data?.address !== closedAddr);
+            if (remaining.length === 0) {
+              submenuExpanded = null; submenuSelection = 0;
+              currentRoot = sendCurrentPage(client);
+            } else {
+              submenuExpanded.entry.children = remaining;
+              submenuSelection = Math.min(submenuSelection, remaining.length - 1);
+              currentRoot = buildSubmenuPage(submenuExpanded.entry, config, filterString, submenuSelection);
+              client.showMenu(currentRoot);
+            }
           }
         }
-      }
-      }
-    } else if (ev.character && /^[1-6]$/.test(ev.character)) {
-      // 1..6 — select item at position (ALT isn't detected because ALT events
-      // don't reach the keyd virtual keyboard). Must come BEFORE letter key filter.
-      const pos = parseInt(ev.character) - 1;
-      if (submenuExpanded) {
-        const children = submenuExpanded.entry.children || [];
-        const target = children[pos];
-        if (target) {
-          if (target.type === 'submenu') {
-            console.log('→ Alt+%d — expanding nested %s', pos + 1, target.name);
-            const oc = target.data?.class || submenuExpanded?.overflowClass || '';
-            const od = (submenuExpanded?.overflowDepth || 0) + 1;
-            submenuExpanded = { entry: target, parentRoot: currentRoot, overflowClass: oc, overflowDepth: od };
-            submenuSelection = 0;
-            currentRoot = buildSubmenuPage(target, config, filterString, 0);
-            client.showMenu(currentRoot);
-          } else {
-            console.log('→ Alt+%d — focusing %s', pos + 1, target.name);
-            executeItem(target, client, config); return;
-          }
-        }
+        setTimeout(pollAndRefresh, 300);
       } else {
-        const filtered = getFiltered(focusedFirstEntries, filterString, fuzzyMode, lastFuzzyItems);
-        const target = filtered[pos];
-        if (target) {
-          if (target.type === 'submenu') {
-            console.log('→ Alt+%d — expanding %s', pos + 1, target.name);
-            submenuExpanded = { entry: target, parentRoot: currentRoot, overflowClass: target.data?.class || target.name, overflowDepth: 0 };
-            submenuSelection = 0;
-            currentRoot = buildSubmenuPage(target, config, filterString, 0);
-            client.showMenu(currentRoot);
-          } else {
-            console.log('→ Alt+%d — executing %s', pos + 1, target.name);
-            executeItem(target, client, config); return;
-          }
-        }
+        // Main menu (not in submenu): remove closed item and regenerate
+        const closedAddr = target.data.address;
+        focusedFirstEntries = focusedFirstEntries.filter(e => e.data?.address !== closedAddr);
+        mainSelection = Math.min(mainSelection, focusedFirstEntries.length - 1);
+        currentRoot = sendCurrentPage(client);
       }
-      return;
+      }
     } else if (ev.character && /^[a-zA-Z0-9 ]$/.test(ev.character)) {
       if (config.fuzzySearch && !fuzzyMode && filterString.length === 0) {
         fuzzyMode = true;
@@ -694,8 +733,34 @@ async function main() {
         const cmd = getLaunchCommand(cls);
         console.log('→ Ctrl+Enter — spawning %s (%s)', ctrlTarget.name, cmd);
         exec('nohup ' + cmd + ' > /dev/null 2>&1 &', { detached: true });
-        // Wait for the new window to appear, then refresh data and regenerate
-        setTimeout(() => {
+        // Poll until focus changes away from Kando, then refocus and refresh
+        let kandoAddr = null;
+        try {
+          const aw = JSON.parse(execSync('hyprctl activewindow -j', { timeout: 2000, encoding: 'utf-8' }));
+          kandoAddr = aw.address || null;
+        } catch {}
+        if (kandoAddr) {
+          let attempts = 0;
+          const poll = () => {
+            attempts++;
+            try {
+              const cur = JSON.parse(execSync('hyprctl activewindow -j', { timeout: 2000, encoding: 'utf-8' }));
+              if (cur.address && cur.address !== kandoAddr) {
+                // New app stole focus — give it back to Kando, then refresh
+                execSync("hyprctl dispatch 'hl.dsp.focus({ last = true })'", { timeout: 2000 });
+                doRefresh();
+                return;
+              }
+            } catch {}
+            if (attempts < 30) setTimeout(poll, 300); // up to ~9 seconds
+            else doRefresh(); // timeout: just refresh anyway
+          };
+          setTimeout(poll, 500); // start polling after 500ms
+        } else {
+          // No Kando address captured — just refresh after a delay
+          setTimeout(doRefresh, 1500);
+        }
+        function doRefresh() {
           try {
             const newResult = collectWindows(config.hiddenWindows);
             const newEntries = collectAllEntries(config, newResult.appGroups);
@@ -733,7 +798,7 @@ async function main() {
           } else {
             currentRoot = sendCurrentPage(client);
           }
-        }, 1000);
+        }
       }
     } else if (ev.name === 'ENTER' && !ev.ctrl) {
       if (submenuExpanded) {
