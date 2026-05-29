@@ -1,355 +1,55 @@
 #!/usr/bin/env node
 'use strict';
-const path = require('path');
-const fs = require('fs');
 const { exec, execSync } = require('child_process');
-const Fuse = require('fuse.js');
 const { loadConfig } = require('./lib/config');
 const { collectWindows } = require('./lib/window-collector');
 const { KandoIPCClient } = require('./lib/kando-ipc');
 const { KeyboardCapture } = require('./lib/key-capture');
-
-function resolveIcon(cls, config) {
-  const themeDir = path.join(config.iconThemeDirectory, config.iconTheme);
-  const candidates = [cls, cls.toLowerCase()];
-  for (const name of candidates) {
-    for (const ext of ['.svg', '.png']) {
-      const filePath = path.join(themeDir, name + ext);
-      try { if (fs.statSync(filePath).isFile()) return name + ext; } catch {}
-    }
-  }
-  return cls;
-}
-
-/** Build a recursive overflow page with up to 6 items + add.svg if more. */
-function buildOverflowPage(windows, config, truncationLimit, icon, appClass) {
-  // Show 5 items + add.svg at position 5 (300°) to avoid overlapping.
-  const page = windows.slice(0, 5);
-  const remaining = windows.length - page.length;
-  const children = page.map((win, i) => ({
-    type: 'simple-button',
-    name: truncate(win.title, truncationLimit),
-    icon, iconTheme: config.iconTheme,
-    angle: i * 60,
-    data: { address: win.address, class: win.class, action: 'focus' },
-  }));
-  if (remaining > 0) {
-    const nextOverflow = buildOverflowPage(windows.slice(5), config, truncationLimit, icon, appClass);
-    children.push({
-      type: 'submenu',
-      name: '+' + remaining,
-      icon: 'add.svg', iconTheme: config.iconTheme,
-      angle: 5 * 60,
-      data: { action: 'show-overflow', class: appClass },
-      children: nextOverflow,
-    });
-  }
-  return children;
-}
-
-function collectAllEntries(config, appGroups) {
-  const { truncationLimit, defaultApps, submenuThreshold } = config;
-  const entries = [];
-  for (const group of appGroups) {
-    const icon = resolveIcon(group.class, config);
-    const truncatedName = truncate(group.class, truncationLimit);
-    if (group.count >= submenuThreshold) {
-      // Build submenu preview children (max 5 + optional +N indicator)
-      // Fixed angles at 0°, 60°, 120°, 180°, 240° align with 60° spacing
-      // and account for Kando's parent gap logic (all items have fixed angles).
-      const previewWindows = group.windows.slice(0, 5);
-      const remaining = group.windows.length - previewWindows.length;
-      const children = previewWindows.map((win, i) => ({
-        type: 'simple-button',
-        name: truncate(win.title, truncationLimit),
-        icon, iconTheme: config.iconTheme,
-        angle: i * 60,
-        data: { address: win.address, class: win.class, action: 'focus' },
-      }));
-      if (remaining > 0) {
-        const overflowChildren = buildOverflowPage(group.windows.slice(5), config, truncationLimit, icon, group.class);
-        children.push({
-          type: 'submenu',
-          name: '+' + remaining,
-          icon: 'add.svg', iconTheme: config.iconTheme,
-          angle: 5 * 60,
-          data: { class: group.class, action: 'show-overflow' },
-          children: overflowChildren,
-        });
-      }
-      entries.push({
-        type: 'submenu', name: truncatedName, icon,
-        iconTheme: config.iconTheme,
-        data: { class: group.class, count: group.count },
-        children,
-      });
-    } else {
-      entries.push({
-        type: 'simple-button', name: truncatedName, icon,
-        iconTheme: config.iconTheme,
-        data: { address: group.windows[0].address, class: group.class, action: 'focus' },
-      });
-    }
-  }
-  const runningClasses = new Set(appGroups.map((g) => g.class.toLowerCase()));
-  for (const app of defaultApps) {
-    if (runningClasses.has(app.name.toLowerCase())) continue;
-    const icon = resolveIcon(app.name, config);
-    entries.push({
-      type: 'simple-button', name: truncate(app.name, truncationLimit), icon,
-      iconTheme: config.iconTheme,
-      data: { command: app.command, action: 'launch' },
-    });
-  }
-  return entries;
-}
-
-function getFiltered(allEntries, filterString, fuzzyMode, fuzzyItems) {
-  if (!filterString) return allEntries;
-  if (fuzzyMode && fuzzyItems) {
-    // Include both app entries and individual window matches
-    const seen = new Set();
-    const result = [];
-    for (const fi of fuzzyItems) {
-      // If match is on a window title, show the individual window
-      if (fi.parent) {
-        const key = 'win:' + (fi.entry.name || '') + (fi.entry.data?.address || '');
-        if (!seen.has(key)) { seen.add(key); result.push(fi.entry); }
-      } else {
-        const key = 'app:' + (fi.entry.name || '') + (fi.entry.data?.class || '');
-        if (!seen.has(key)) { seen.add(key); result.push(fi.entry); }
-      }
-    }
-    return result;
-  }
-  const lower = filterString.toLowerCase();
-  return allEntries.filter((e) => e.name.toLowerCase().includes(lower));
-}
-
-function centerName(filterString) {
-  return filterString || '';
-}
-
-const QUICK_KEYS = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6'];
-
-function assignAngles(items, maxItems) {
-  const step = 360 / maxItems;
-  return items.map((item, i) => ({
-    ...item,
-    angle: i * step,
-    quickSelectKey: i < QUICK_KEYS.length ? QUICK_KEYS[i] : undefined,
-  }));
-}
-
-// ---------------------------------------------------------------------------
-// Desktop file lookup
-// ---------------------------------------------------------------------------
-
-const DESKTOP_DIRS = [
-  '/run/current-system/sw/share/applications',
-  process.env.HOME + '/.local/share/applications',
-  '/usr/share/applications',
-  '/usr/local/share/applications',
-];
-
-function getLaunchCommand(appClass) {
-  const lowerClass = appClass.toLowerCase();
-  for (const dir of DESKTOP_DIRS) {
-    try {
-      const files = fs.readdirSync(dir);
-      for (const file of files) {
-        if (!file.endsWith('.desktop')) continue;
-        try {
-          const content = fs.readFileSync(dir + '/' + file, 'utf-8');
-          const wmMatch = content.match(/^StartupWMClass=(.+)$/m);
-          const nameMatch = content.match(/^Name=(.+)$/m);
-          const fileBase = file.replace('.desktop', '').toLowerCase();
-          const wmClass = wmMatch ? wmMatch[1].toLowerCase() : '';
-          const appName = nameMatch ? nameMatch[1].toLowerCase() : '';
-          if (wmClass === lowerClass || fileBase === lowerClass || appName === lowerClass) {
-            const execMatch = content.match(/^Exec=(.+)$/m);
-            if (execMatch) {
-              return execMatch[1].replace(/%[uUfFc]/g, '').trim();
-            }
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-  return appClass;
-}
+const {
+  collectAllEntries,
+  buildPaginatedRoot,
+  buildPaginatedRootWithName,
+  buildSubmenuPage,
+  getFiltered,
+  truncate,
+} = require('./lib/menu-builder');
+const { getLaunchCommand, executeItem, lookupItemByPath } = require('./lib/actions');
+const { buildFuzzyList, runFuzzySearch } = require('./lib/fuzzy-search');
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function truncate(str, maxLen) {
-  if (!str || str.length <= maxLen) return str || '';
-  return str.substring(0, maxLen - 1) + '…';
+/**
+ * Reorder entries so the focused app appears first.
+ * @param {object[]} entries
+ * @param {string}   focusedClass
+ * @returns {object[]}
+ */
+function reorderFocusedFirst(entries, focusedClass) {
+  if (!focusedClass) return entries;
+  const lowerClass = focusedClass.toLowerCase();
+  const idx = entries.findIndex(e => e.name.toLowerCase() === lowerClass);
+  if (idx > 0) {
+    return [entries[idx], ...entries.slice(0, idx), ...entries.slice(idx + 1)];
+  }
+  return entries;
 }
 
-function lookupItemByPath(root, path) {
-  let item = root;
-  for (let i = 0; i < path.length; i++) {
-    const idx = path[i];
-    if (!item.children || idx >= item.children.length) return null;
-    item = item.children[idx];
-  }
-  return item;
+/**
+ * Refresh window data by re-collecting windows and rebuilding entries.
+ * Returns { appGroups, newEntries, newFocused }.
+ */
+function refreshWindowData(config, focusedClass) {
+  const newResult = collectWindows(config.hiddenWindows);
+  const newEntries = collectAllEntries(config, newResult.appGroups);
+  const newFocused = reorderFocusedFirst(newEntries, focusedClass);
+  return { appGroups: newResult.appGroups, newEntries, newFocused };
 }
 
-function executeItem(item, client, config) {
-  const data = item.data || {};
-  switch (data.action) {
-    case 'focus': {
-      const address = data.address;
-      if (!address) { console.error('✖ No address'); break; }
-      try {
-        const cmd = 'hyprctl dispatch \'hl.dsp.focus({ window = "address:' + address + '" })\'';
-        console.log('→ Focusing %s (%s)', truncate(address, 16), item.name);
-        execSync(cmd, { timeout: 3000 });
-      } catch (err) { console.error('✖ Focus failed:', err.message); }
-      break;
-    }
-    case 'launch': {
-      const command = data.command;
-      if (!command) { console.error('✖ No command'); break; }
-      console.log('→ Launching %s', item.name);
-      exec('nohup ' + command + ' > /dev/null 2>&1 &', { detached: true });
-      break;
-    }
-    case 'show-overflow':
-      return 'ignore';
-    default:
-      if (data.action) console.error('✖ Unknown action:', data.action);
-      break;
-  }
-  try { execSync('kando --close-menu', { timeout: 2000 }); } catch {}
-  client.close();
-  process.exit(0);
-}
-
-function buildPaginatedRootWithName(displayEntries, config, mainSelection, rootName, maxItems) {
-  const marked = displayEntries.map((entry, i) => {
-    if (i === mainSelection) {
-      const sel = entry.icon.replace(/(\.[^.]+)$/, '_selected$1');
-      return { ...entry, icon: sel, iconTheme: config.iconTheme };
-    }
-    return entry;
-  });
-  if (marked.length <= maxItems) {
-    return {
-      type: 'simple-button', name: rootName, icon: 'arrow_' + (mainSelection + 1) + '.svg', iconTheme: config.iconTheme,
-      children: assignAngles([...marked], maxItems),
-    };
-  }
-  const pageSize = maxItems - 1;
-  const pageItems = marked.slice(0, pageSize);
-  const overflowItems = marked.slice(pageSize);
-  function makeOverflow(items) {
-    if (items.length <= maxItems) return items.map((e, i) => ({ ...e, angle: i * 60 }));
-    const ov = items.slice(0, pageSize);
-    const rest = items.slice(pageSize);
-    ov.push({
-      type: 'submenu', name: '+' + rest.length, icon: 'add.svg',
-      iconTheme: config.iconTheme, angle: pageSize * 60,
-      data: { action: 'show-overflow' },
-      children: makeOverflow(rest),
-    });
-    return ov;
-  }
-  const overflowChildren = makeOverflow(overflowItems);
-  pageItems.push({
-    type: 'submenu', name: '+' + overflowItems.length, icon: 'add.svg',
-    iconTheme: config.iconTheme, angle: pageSize * 60,
-    data: { action: 'show-overflow' },
-    children: overflowChildren,
-  });
-  return {
-    type: 'simple-button', name: rootName, icon: 'arrow_' + (mainSelection + 1) + '.svg', iconTheme: config.iconTheme,
-    children: assignAngles(pageItems, maxItems),
-  };
-}
-
-function buildPaginatedRoot(allEntries, currentPage, config, filterString, mainSelection, preFiltered, overrideRootName) {
-  const { maxItems } = config;
-  let displayEntries = preFiltered || getFiltered(allEntries, filterString);
-
-  if (overrideRootName !== undefined) {
-    return buildPaginatedRootWithName(displayEntries, config, mainSelection, overrideRootName, maxItems);
-  }
-
-  if (displayEntries.length === 0) {
-    return { type: 'simple-button', name: '>', icon: 'arrow_' + (mainSelection + 1) + '.svg', iconTheme: config.iconTheme, children: undefined };
-  }
-
-  // Compute center text: show selected item's name
-  const selIdx = Math.min(mainSelection, displayEntries.length - 1);
-  const selName = displayEntries[selIdx]?.name || '';
-  const rootName = truncate(selName, 35) + '  (' + (selIdx + 1) + '/' + displayEntries.length + ')';
-
-  const marked = displayEntries.map((entry, i) => {
-    if (i === mainSelection) {
-      const sel = entry.icon.replace(/(\.[^.]+)$/, '_selected$1');
-      return { ...entry, icon: sel, iconTheme: config.iconTheme };
-    }
-    return entry;
-  });
-
-  // Show up to 6 items + add.svg overflow submenu if there are more.
-  const pageSize = maxItems - 1; // reserve last slot for add.svg if needed
-  if (marked.length > maxItems) {
-    const pageItems = marked.slice(0, pageSize);
-    const overflowItems = marked.slice(pageSize);
-    // Build recursive overflow submenu
-    function makeOverflow(items) {
-      if (items.length <= maxItems) return items.map((e, i) => ({ ...e, angle: i * 60 }));
-      const ov = items.slice(0, pageSize);
-      const rest = items.slice(pageSize);
-      ov.push({
-        type: 'submenu', name: '+' + rest.length, icon: 'add.svg',
-        iconTheme: config.iconTheme, angle: pageSize * 60,
-        data: { action: 'show-overflow' },
-        children: makeOverflow(rest),
-      });
-      return ov;
-    }
-    const overflowChildren = makeOverflow(overflowItems);
-    pageItems.push({
-      type: 'submenu', name: '+' + overflowItems.length, icon: 'add.svg',
-      iconTheme: config.iconTheme, angle: pageSize * 60,
-      data: { action: 'show-overflow' },
-      children: overflowChildren,
-    });
-    return {
-      type: 'simple-button', name: rootName, icon: 'arrow_' + (mainSelection + 1) + '.svg', iconTheme: config.iconTheme,
-      children: assignAngles(pageItems, maxItems),
-    };
-  }
-
-  return {
-    type: 'simple-button', name: rootName, icon: 'arrow_' + (mainSelection + 1) + '.svg', iconTheme: config.iconTheme,
-    children: assignAngles([...marked], maxItems),
-  };
-}
-
-function buildSubmenuPage(submenuEntry, config, filterString, selection) {
-  const children = (submenuEntry.children || []).map((child, i) => {
-    const c = { ...child };
-    if (i === selection) {
-      const sel = c.icon.replace(/(\.[^.]+)$/, '_selected$1');
-      c.icon = sel; c.iconTheme = config.iconTheme;
-    }
-    return c;
-  });
-  const maxItems = config.maxItems;
-  const selName = children[selection]?.name || '';
-  const center = truncate(selName, 35) + '  (' + (selection + 1) + '/' + children.length + ')';
-  return {
-    type: 'simple-button', name: center, icon: 'arrow_' + (selection + 1) + '.svg', iconTheme: config.iconTheme,
-    children: assignAngles(children, maxItems),
-  };
-}
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 async function main() {
   const { config, errors, warnings } = loadConfig();
@@ -360,6 +60,7 @@ async function main() {
   console.log('✓ Configuration loaded');
   console.log('  defaultApps:', config.defaultApps.length, ' maxItems:', config.maxItems);
 
+  // --- Collect running windows ---
   let appGroups = [];
   try {
     const result = collectWindows(config.hiddenWindows);
@@ -370,106 +71,46 @@ async function main() {
   let allEntries = collectAllEntries(config, appGroups);
   console.log('✓ All entries: %d', allEntries.length);
 
-  // Capture the currently focused window so we can pin it at 0°.
-  let focusedClass = null, focusedFirstEntries = allEntries;
+  // --- Detect focused window ---
+  let focusedClass = null;
+  let focusedFirstEntries = allEntries;
   try {
     const stdout = execSync('hyprctl activewindow -j', { timeout: 3000, encoding: 'utf-8' });
     const data = JSON.parse(stdout);
     if (data && data.class) {
       focusedClass = data.class;
-      // Reorder: put the focused app first, keep others in original order
-      const lowerClass = focusedClass.toLowerCase();
-      const idx = allEntries.findIndex(e => e.name.toLowerCase() === lowerClass);
-      if (idx > 0) {
-        focusedFirstEntries = [allEntries[idx], ...allEntries.slice(0, idx), ...allEntries.slice(idx + 1)];
-      }
+      focusedFirstEntries = reorderFocusedFirst(allEntries, focusedClass);
     }
   } catch {}
   console.log('✓ Focused:', focusedClass || '(unknown)');
 
-  let currentRoot = null, filterString = '';
-  let mainSelection = 0, submenuExpanded = null, submenuSelection = 0;
-  let fuzzyMode = false; // true when user is typing a fuzzy search
+  // --- State ---
+  let currentRoot = null;
+  let filterString = '';
+  let mainSelection = 0;
+  /** @type {{ entry: object, parentRoot: object, overflowClass?: string, overflowDepth?: number }|null} */
+  let submenuExpanded = null;
+  let submenuSelection = 0;
+  let fuzzyMode = false;
   let prevFilterString = '';
   let prevMainSelection = 0;
   let prevSubmenuState = null;
-
-  // Build a flat searchable list from all entries + window titles
-  // Recursively collect all windows (including those inside add.svg overflows)
-  function collectAllWindows(children, entryName) {
-    const items = [];
-    for (const child of (children || [])) {
-      if (child.type === 'submenu' && child.icon === 'add.svg') {
-        items.push(...collectAllWindows(child.children, entryName));
-      } else if (child.data?.action === 'focus') {
-        items.push({ text: (entryName || '') + ' ' + (child.name || ''), entry: child, parent: null });
-      }
-    }
-    return items;
-  }
-
-  function buildFuzzyList() {
-    if (!config.fuzzySearch) return null;
-    const items = [];
-    if (submenuExpanded) {
-      for (const child of (submenuExpanded.entry.children || [])) {
-        items.push({ text: child.name, entry: child, parent: submenuExpanded.entry });
-      }
-    } else {
-      for (const entry of focusedFirstEntries) {
-        items.push({ text: entry.name, entry, parent: null });
-        const allWins = collectAllWindows(entry.children, entry.name);
-        items.push(...allWins);
-      }
-    }
-    return items;
-  }
-
-  function runFuzzySearch(query) {
-    if (!config.fuzzySearch || !query) return null;
-    let searchText = query;
-    let searchMode = 'all';
-    if (query.startsWith(':class ')) { searchMode = 'class'; searchText = query.slice(7); }
-    else if (query.startsWith(':title ')) { searchMode = 'title'; searchText = query.slice(7); }
-    else if (query === ':' || query === ':class' || query === ':title') return [];
-
-    const items = buildFuzzyList();
-    if (!items || items.length === 0) return [];
-
-    let filtered = items;
-    if (searchMode === 'class') {
-      filtered = items.filter(i => !i.parent && i.entry.data?.class);
-    } else if (searchMode === 'title') {
-      filtered = items.filter(i => i.parent);
-    }
-
-    console.log('  Fuse search: %d candidates for "%s"', filtered.length, searchText);
-    // Show all candidate texts (first 15)
-    filtered.slice(0, 15).forEach((it, idx) => {
-      console.log('    [%d] text="%s"', idx, it.text.substring(0, 60));
-    });
-
-    const fuse = new Fuse(filtered, { keys: ['text'], threshold: 0.4 });
-    const results = fuse.search(searchText);
-    console.log('  Fuse results: %d', results.length);
-    results.slice(0, 5).forEach(r => console.log('    matched: "%s"', r.item.text.substring(0, 60)));
-    return results.map(r => r.item);
-  }
-
   let lastFuzzyItems = null;
+
+  // --- IPC helper: send current page ---
 
   function sendCurrentPage(client) {
     let entries = focusedFirstEntries;
     let useFuzzy = null;
     if (config.fuzzySearch && fuzzyMode && filterString) {
-      useFuzzy = runFuzzySearch(filterString);
+      useFuzzy = runFuzzySearch(filterString, config, focusedFirstEntries, submenuExpanded);
       lastFuzzyItems = useFuzzy;
-      // Debug: show what fuzzy found
       if (useFuzzy) {
         console.log('  Fuzzy debug: %d raw results for "%s":', useFuzzy.length, filterString);
         useFuzzy.slice(0, 10).forEach(f => {
           const type = f.parent ? 'window' : 'app';
-          console.log('    [%s] text="%s" name="%s"', type, f.text.substring(0, 60), (f.entry?.name || '').substring(0, 40));
+          console.log('    [%s] text="%s" name="%s"', type, f.text.substring(0, 60),
+            (f.entry?.name || '').substring(0, 40));
         });
       }
     } else {
@@ -482,7 +123,8 @@ async function main() {
       const count = root.children ? root.children.length : 0;
       console.log('  Fuzzy: %d item(s) in menu for "%s"', count, filterString);
       if (filtered.length > 0) {
-        filtered.slice(0, 10).forEach(e => console.log('    entry: "%s" type=%s class=%s', e.name, e.type || '?', e.data?.class || '?'));
+        filtered.slice(0, 10).forEach(e =>
+          console.log('    entry: "%s" type=%s class=%s', e.name, e.type || '?', e.data?.class || '?'));
       }
       client.showMenu(root);
       return root;
@@ -495,6 +137,8 @@ async function main() {
     return root;
   }
 
+  // --- Kando IPC connection ---
+
   const client = new KandoIPCClient();
   let menuOpened = false;
   client.on('open', () => { if (menuOpened) return; menuOpened = true; console.log('✓ Kando menu opened'); });
@@ -505,7 +149,6 @@ async function main() {
     if (key === lastSelectKey) return;
     lastSelectKey = key;
 
-    // Track submenu expansion so Enter works after clicking into a submenu.
     if (ev.target === 'submenu' && currentRoot?.children) {
       const subIdx = ev.path[0];
       const subEntry = currentRoot.children[subIdx];
@@ -542,20 +185,26 @@ async function main() {
   currentRoot = sendCurrentPage(client);
   console.log('✓ KAATWS ready');
 
+  // --- Keyboard capture ---
+
   const keyboard = new KeyboardCapture();
   keyboard.on('key', (ev) => {
+    // --- ESCAPE ---
     if (ev.name === 'ESCAPE' && fuzzyMode && filterString) {
-      // ESC during fuzzy search: clear filter, exit fuzzy mode, restore menu
       console.log('→ ESC — exiting fuzzy search');
       filterString = ''; fuzzyMode = false; mainSelection = prevMainSelection; lastFuzzyItems = null;
-      if (prevSubmenuState) { submenuExpanded = prevSubmenuState; submenuSelection = 0; }
+      if (prevSubmenuState) {
+        submenuExpanded = prevSubmenuState; submenuSelection = 0;
+      }
       currentRoot = sendCurrentPage(client); return;
     }
-    if (ev.name === 'ESCAPE') { console.log('→ ESC — closing menu'); keyboard.stop(); client.close(); process.exit(0); }
+    if (ev.name === 'ESCAPE') {
+      console.log('→ ESC — closing menu'); keyboard.stop(); client.close(); process.exit(0);
+    }
 
     let menuChanged = false;
 
-    // Tab — move selection to next slot clockwise
+    // --- TAB / Shift+TAB — cycle selection ---
     if (ev.name === 'TAB' && !ev.shift) {
       if (submenuExpanded) {
         const children = submenuExpanded.entry.children || [];
@@ -572,8 +221,6 @@ async function main() {
           menuChanged = true;
         }
       }
-
-    // Shift+Tab — move selection to previous slot
     } else if (ev.name === 'TAB' && ev.shift) {
       if (submenuExpanded) {
         const children = submenuExpanded.entry.children || [];
@@ -591,12 +238,16 @@ async function main() {
         }
       }
 
+    // --- Ctrl+h — back from submenu ---
     } else if (ev.name === 'h' && ev.ctrl) {
       if (submenuExpanded) { submenuExpanded = null; submenuSelection = 0; filterString = ''; mainSelection = 0; menuChanged = true; }
+
+    // --- BACKSPACE — delete filter char ---
     } else if (ev.name === 'BACKSPACE') {
       if (filterString.length > 0) { filterString = filterString.slice(0, -1); mainSelection = 0; menuChanged = true; }
+
+    // --- F1-F6 — quick select / expand ---
     } else if (/^F[1-6]$/.test(ev.name)) {
-      // F1-F6 — select and execute item at that position
       const fIdx = parseInt(ev.name[1]) - 1;
       let fItem = null;
       if (submenuExpanded) {
@@ -608,7 +259,10 @@ async function main() {
       if (fItem) {
         if (fItem.type === 'submenu') {
           console.log('→ F%d — expanding %s', fIdx + 1, fItem.name);
-          submenuExpanded = { entry: fItem, parentRoot: currentRoot, overflowClass: fItem.data?.class || fItem.name, overflowDepth: 0 };
+          submenuExpanded = {
+            entry: fItem, parentRoot: currentRoot,
+            overflowClass: fItem.data?.class || fItem.name, overflowDepth: 0,
+          };
           submenuSelection = 0;
           currentRoot = buildSubmenuPage(fItem, config, filterString, 0);
           client.showMenu(currentRoot);
@@ -617,196 +271,38 @@ async function main() {
           executeItem(fItem, client, config); return;
         }
       }
+
+    // --- c / Ctrl+C — type 'c' or close selected window ---
     } else if (ev.name === 'c') {
       if (!ev.ctrl) { filterString += 'c'; mainSelection = 0; menuChanged = true; }
       else {
-      // Ctrl+C — close the selected window and regenerate menu
-      let target = null;
-      if (submenuExpanded) {
-        target = (submenuExpanded.entry.children || [])[submenuSelection];
-      } else {
-        const filtered = getFiltered(focusedFirstEntries, filterString, fuzzyMode, lastFuzzyItems);
-        target = filtered[mainSelection];
+        handleCtrlC(client);
       }
-      if (target && target.data?.action === 'focus' && target.data?.address) {
-        try {
-          execSync("hyprctl dispatch 'hl.dsp.window.close({ window = \"address:" + target.data.address + "\" })'", { timeout: 3000 });
-          console.log('→ Closed %s', target.name);
-        } catch (err) { console.error('✖ Close failed:', err.message); }
-        // Poll until the window is actually gone, then refresh
-        const closedAddr = target.data.address;
-        let attempts = 0;
-        const pollAndRefresh = () => {
-          attempts++;
-          try {
-            const clients = JSON.parse(execSync('hyprctl clients -j', { timeout: 3000, encoding: 'utf-8' }));
-            const stillExists = clients.some(c => c.address === closedAddr);
-            if (!stillExists) {
-              // Window is gone — refresh data and rebuild menu
-              try {
-                const newResult = collectWindows(config.hiddenWindows);
-                const newEntries = collectAllEntries(config, newResult.appGroups);
-                let newFocused = newEntries;
-                if (focusedClass) {
-                  const lc = focusedClass.toLowerCase();
-                  const idx = newEntries.findIndex(e => e.name.toLowerCase() === lc);
-                  if (idx > 0) newFocused = [newEntries[idx], ...newEntries.slice(0, idx), ...newEntries.slice(idx + 1)];
-                }
-                focusedFirstEntries = newFocused;
-                allEntries = newEntries;
-              } catch {}
-              // Find refreshed entry — try data.class first, then name
-              let targetClass = submenuExpanded?.overflowClass || '';
-              let entry = allEntries.find(e =>
-                e.data?.class && e.data.class.toLowerCase() === targetClass.toLowerCase()
-              ) || allEntries.find(e => e.name.toLowerCase() === targetClass.toLowerCase());
-              if (entry && submenuExpanded?.overflowDepth > 0) {
-                for (let d = 0; d < submenuExpanded.overflowDepth; d++) {
-                  const addSvg = (entry.children || []).find(c => c.type === 'submenu' && c.icon === 'add.svg');
-                  if (addSvg) entry = addSvg; else break;
-                }
-              }
-              if (entry && (!entry.children || entry.children.length === 0)) {
-                // No children left — exit submenu back to main menu
-                submenuExpanded = null;
-                submenuSelection = 0;
-                currentRoot = sendCurrentPage(client);
-              } else if (entry && entry.children) {
-                submenuExpanded.entry = entry;
-                submenuSelection = Math.min(submenuSelection, entry.children.length - 1);
-                currentRoot = buildSubmenuPage(entry, config, filterString, submenuSelection);
-                client.showMenu(currentRoot);
-              } else {
-                // Entry not found or type changed — fall back to main menu
-                submenuExpanded = null;
-                submenuSelection = 0;
-                currentRoot = sendCurrentPage(client);
-              }
-              return;
-            }
-          } catch {}
-          if (attempts < 20) setTimeout(pollAndRefresh, 200); else doFallbackRefresh();
-        };
-        function doFallbackRefresh() {
-          if (submenuExpanded) {
-            const remaining = (submenuExpanded.entry.children || []).filter(c => c.data?.address !== closedAddr);
-            if (remaining.length === 0) {
-              submenuExpanded = null; submenuSelection = 0;
-              currentRoot = sendCurrentPage(client);
-            } else {
-              submenuExpanded.entry.children = remaining;
-              submenuSelection = Math.min(submenuSelection, remaining.length - 1);
-              currentRoot = buildSubmenuPage(submenuExpanded.entry, config, filterString, submenuSelection);
-              client.showMenu(currentRoot);
-            }
-          }
-        }
-        setTimeout(pollAndRefresh, 300);
-      } else {
-        // Main menu (not in submenu): remove closed item and regenerate
-        const closedAddr = target.data.address;
-        focusedFirstEntries = focusedFirstEntries.filter(e => e.data?.address !== closedAddr);
-        mainSelection = Math.min(mainSelection, focusedFirstEntries.length - 1);
-        currentRoot = sendCurrentPage(client);
-      }
-      }
+
+    // --- a-z, 0-9, space — type filter character ---
     } else if (ev.character && /^[a-zA-Z0-9 ]$/.test(ev.character)) {
       if (config.fuzzySearch && !fuzzyMode && filterString.length === 0) {
         fuzzyMode = true;
         prevFilterString = filterString;
         prevMainSelection = mainSelection;
-        prevSubmenuState = submenuExpanded ? { entry: submenuExpanded.entry, overflowClass: submenuExpanded.overflowClass, overflowDepth: submenuExpanded.overflowDepth } : null;
+        prevSubmenuState = submenuExpanded
+          ? { entry: submenuExpanded.entry, overflowClass: submenuExpanded.overflowClass,
+              overflowDepth: submenuExpanded.overflowDepth }
+          : null;
       }
       filterString += ev.character.toLowerCase(); mainSelection = 0; menuChanged = true;
 
+    // --- Ctrl+Enter — spawn new instance ---
     } else if (ev.name === 'ENTER' && ev.ctrl) {
-      // Ctrl+Enter — spawn new instance and regenerate menu
-      let ctrlTarget = null;
-      if (submenuExpanded) {
-        ctrlTarget = submenuExpanded.entry;
-      } else {
-        const filtered = getFiltered(focusedFirstEntries, filterString, fuzzyMode, lastFuzzyItems);
-        ctrlTarget = filtered[mainSelection];
-      }
-      if (ctrlTarget) {
-        const cls = ctrlTarget.data?.class || ctrlTarget.name;
-        const cmd = getLaunchCommand(cls);
-        console.log('→ Ctrl+Enter — spawning %s (%s)', ctrlTarget.name, cmd);
-        exec('nohup ' + cmd + ' > /dev/null 2>&1 &', { detached: true });
-        // Poll until focus changes away from Kando, then refocus and refresh
-        let kandoAddr = null;
-        try {
-          const aw = JSON.parse(execSync('hyprctl activewindow -j', { timeout: 2000, encoding: 'utf-8' }));
-          kandoAddr = aw.address || null;
-        } catch {}
-        if (kandoAddr) {
-          let attempts = 0;
-          const poll = () => {
-            attempts++;
-            try {
-              const cur = JSON.parse(execSync('hyprctl activewindow -j', { timeout: 2000, encoding: 'utf-8' }));
-              if (cur.address && cur.address !== kandoAddr) {
-                // New app stole focus — give it back to Kando, then refresh
-                execSync("hyprctl dispatch 'hl.dsp.focus({ last = true })'", { timeout: 2000 });
-                doRefresh();
-                return;
-              }
-            } catch {}
-            if (attempts < 30) setTimeout(poll, 300); // up to ~9 seconds
-            else doRefresh(); // timeout: just refresh anyway
-          };
-          setTimeout(poll, 500); // start polling after 500ms
-        } else {
-          // No Kando address captured — just refresh after a delay
-          setTimeout(doRefresh, 1500);
-        }
-        function doRefresh() {
-          try {
-            const newResult = collectWindows(config.hiddenWindows);
-            const newEntries = collectAllEntries(config, newResult.appGroups);
-            // Rebuild focusedFirstEntries with new data
-            let newFocused = newEntries;
-            if (focusedClass) {
-              const lc = focusedClass.toLowerCase();
-              const idx = newEntries.findIndex(e => e.name.toLowerCase() === lc);
-              if (idx > 0) {
-                newFocused = [newEntries[idx], ...newEntries.slice(0, idx), ...newEntries.slice(idx + 1)];
-              }
-            }
-            focusedFirstEntries = newFocused;
-            allEntries = newEntries;
-          } catch {}
-          // Regenerate the menu (with refreshed data)
-          if (submenuExpanded) {
-            let entry = allEntries.find(e =>
-              e.data?.class && e.data.class.toLowerCase() ===
-                (submenuExpanded.overflowClass || '').toLowerCase()
-            );
-            // Walk down through overflow add.svg items to reach current depth
-            if (entry && submenuExpanded.overflowDepth > 0) {
-              for (let d = 0; d < submenuExpanded.overflowDepth; d++) {
-                const addSvg = (entry.children || []).find(c => c.type === 'submenu' && c.icon === 'add.svg');
-                if (addSvg) entry = addSvg;
-                else break;
-              }
-            }
-            if (entry) {
-              submenuExpanded.entry = entry;
-              currentRoot = buildSubmenuPage(entry, config, filterString, submenuSelection);
-              client.showMenu(currentRoot);
-            }
-          } else {
-            currentRoot = sendCurrentPage(client);
-          }
-        }
-      }
+      handleCtrlEnter(client);
+
+    // --- Enter — execute / expand ---
     } else if (ev.name === 'ENTER' && !ev.ctrl) {
       if (submenuExpanded) {
         const children = submenuExpanded.entry.children || [];
         const target = children[submenuSelection];
         if (target) {
           if (target.type === 'submenu') {
-            // Expand nested submenu (e.g. add.svg overflow)
             console.log('→ Enter — expanding nested %s', target.name);
             const overflowClass = target.data?.class || submenuExpanded?.overflowClass || '';
             const overflowDepth = (submenuExpanded?.overflowDepth || 0) + 1;
@@ -815,7 +311,8 @@ async function main() {
             currentRoot = buildSubmenuPage(target, config, filterString, 0);
             client.showMenu(currentRoot);
           } else {
-            console.log('→ Enter — focusing %s', target.name); executeItem(target, client, config); return;
+            console.log('→ Enter — focusing %s', target.name);
+            executeItem(target, client, config); return;
           }
         }
       } else {
@@ -829,51 +326,46 @@ async function main() {
             submenuSelection = 0;
             currentRoot = buildSubmenuPage(entry, config, filterString, 0);
             client.showMenu(currentRoot);
-          } else { console.log('→ Enter — executing %s', entry.name); executeItem(entry, client, config); return; }
+          } else {
+            console.log('→ Enter — executing %s', entry.name);
+            executeItem(entry, client, config); return;
+          }
         }
       }
       return;
     }
 
+    // --- Rebuild menu if state changed ---
     if (menuChanged) {
       if (submenuExpanded) {
         if (fuzzyMode && filterString) {
-          const useFuzzy = runFuzzySearch(filterString);
-          lastFuzzyItems = useFuzzy;
-          if (useFuzzy) {
-            console.log('  Submenu fuzzy debug: %d raw for "%s":', useFuzzy.length, filterString);
-            useFuzzy.slice(0, 10).forEach(f => console.log('    text="%s" name="%s"', f.text.substring(0, 50), (f.entry?.name || '').substring(0, 40)));
-          }
-          const filtered = getFiltered(focusedFirstEntries, filterString, fuzzyMode, useFuzzy);
-          const rootName = filterString;
-          const count = filtered.length;
-          console.log('  Fuzzy in submenu: %d item(s) for "%s"', count, filterString);
-          if (count === 0) {
-            client.showMenu({ type: 'simple-button', name: rootName, icon: 'gps_fixed', iconTheme: 'material-symbols-rounded', children: undefined });
-            return;
-          }
-          const root = buildPaginatedRootWithName(filtered, config, mainSelection, rootName, config.maxItems);
-          client.showMenu(root); return;
+          handleFuzzySubmenu(client);
+          return;
         }
         currentRoot = buildSubmenuPage(submenuExpanded.entry, config, filterString, submenuSelection);
         client.showMenu(currentRoot); return;
       }
-      // Compute fuzzy results here (before sendCurrentPage) for auto-select
-      let fuzzyForAuto = null;
-      if (fuzzyMode && filterString && config.fuzzySearch) {
-        fuzzyForAuto = runFuzzySearch(filterString);
-        lastFuzzyItems = fuzzyForAuto;
-      }
+      // Auto-select: if exactly one match remains, execute or expand it
+      const fuzzyForAuto = fuzzyMode && filterString && config.fuzzySearch
+        ? runFuzzySearch(filterString, config, focusedFirstEntries, submenuExpanded)
+        : null;
+      if (fuzzyForAuto) lastFuzzyItems = fuzzyForAuto;
       const matches = getFiltered(focusedFirstEntries, filterString, fuzzyMode, fuzzyForAuto);
       if (matches.length === 1 && filterString.length > 0) {
         const entry = matches[0];
         if (entry.type === 'submenu') {
-          console.log('→ Auto-select: expanding %s (%d windows)', entry.name, entry.children?.length || 0);
-          submenuExpanded = { entry, parentRoot: currentRoot, overflowClass: entry.data?.class || entry.name, overflowDepth: 0 }; submenuSelection = 0;
+          console.log('→ Auto-select: expanding %s (%d windows)',
+            entry.name, entry.children?.length || 0);
+          submenuExpanded = {
+            entry, parentRoot: currentRoot,
+            overflowClass: entry.data?.class || entry.name, overflowDepth: 0,
+          };
+          submenuSelection = 0;
           currentRoot = buildSubmenuPage(entry, config, filterString, 0);
           client.showMenu(currentRoot); return;
         }
-        console.log('→ Auto-select: executing %s', entry.name); keyboard.stop();
+        console.log('→ Auto-select: executing %s', entry.name);
+        keyboard.stop();
         executeItem(entry, client, config); return;
       }
       currentRoot = sendCurrentPage(client);
@@ -886,5 +378,212 @@ async function main() {
   else { console.log('✓ Keyboard capture active'); }
 
   process.on('SIGINT', () => { keyboard.stop(); client.close(); process.exit(0); });
+
+  // -----------------------------------------------------------------------
+  // Inline helper handlers (extracted for clarity but keep state access)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Ctrl+C — close the selected window and regenerate menu.
+   */
+  function handleCtrlC(client) {
+    let target = null;
+    if (submenuExpanded) {
+      target = (submenuExpanded.entry.children || [])[submenuSelection];
+    } else {
+      const filtered = getFiltered(focusedFirstEntries, filterString, fuzzyMode, lastFuzzyItems);
+      target = filtered[mainSelection];
+    }
+    if (target && target.data?.action === 'focus' && target.data?.address) {
+      const closedAddr = target.data.address;
+      try {
+        execSync("hyprctl dispatch 'hl.dsp.window.close({ window = \"address:" + closedAddr + "\" })'",
+          { timeout: 3000 });
+        console.log('→ Closed %s', target.name);
+      } catch (err) { console.error('✖ Close failed:', err.message); return; }
+      pollUntilGone(closedAddr, client);
+    }
+  }
+
+  /**
+   * Poll until a closed window is gone, then refresh the menu.
+   */
+  function pollUntilGone(closedAddr, client) {
+    let attempts = 0;
+    const poll = () => {
+      attempts++;
+      try {
+        const clients = JSON.parse(
+          execSync('hyprctl clients -j', { timeout: 3000, encoding: 'utf-8' })
+        );
+        const stillExists = clients.some(c => c.address === closedAddr);
+        if (!stillExists) {
+          doRefreshAfterClose(client, closedAddr);
+          return;
+        }
+      } catch {}
+      if (attempts < 20) setTimeout(poll, 200);
+      else fallbackRefreshAfterClose(client, closedAddr);
+    };
+    setTimeout(poll, 300);
+  }
+
+  function doRefreshAfterClose(client, closedAddr) {
+    try {
+      const { appGroups: newGroups, newEntries, newFocused } = refreshWindowData(config, focusedClass);
+      appGroups = newGroups; // keep appGroups in sync
+      focusedFirstEntries = newFocused;
+      allEntries = newEntries;
+    } catch {}
+
+    // Rebuild submenu or main menu
+    let targetClass = submenuExpanded?.overflowClass || '';
+    let entry = allEntries.find(e =>
+      e.data?.class && e.data.class.toLowerCase() === targetClass.toLowerCase()
+    ) || allEntries.find(e => e.name.toLowerCase() === targetClass.toLowerCase());
+    if (entry && submenuExpanded?.overflowDepth > 0) {
+      for (let d = 0; d < submenuExpanded.overflowDepth; d++) {
+        const addSvg = (entry.children || []).find(c => c.type === 'submenu' && c.icon === 'add.svg');
+        if (addSvg) entry = addSvg; else break;
+      }
+    }
+    if (entry && (!entry.children || entry.children.length === 0)) {
+      submenuExpanded = null; submenuSelection = 0;
+      currentRoot = sendCurrentPage(client);
+    } else if (entry && entry.children) {
+      submenuExpanded.entry = entry;
+      submenuSelection = Math.min(submenuSelection, entry.children.length - 1);
+      currentRoot = buildSubmenuPage(entry, config, filterString, submenuSelection);
+      client.showMenu(currentRoot);
+    } else {
+      submenuExpanded = null; submenuSelection = 0;
+      currentRoot = sendCurrentPage(client);
+    }
+  }
+
+  function fallbackRefreshAfterClose(client, closedAddr) {
+    if (submenuExpanded) {
+      const remaining = (submenuExpanded.entry.children || [])
+        .filter(c => c.data?.address !== closedAddr);
+      if (remaining.length === 0) {
+        submenuExpanded = null; submenuSelection = 0;
+        currentRoot = sendCurrentPage(client);
+      } else {
+        submenuExpanded.entry.children = remaining;
+        submenuSelection = Math.min(submenuSelection, remaining.length - 1);
+        currentRoot = buildSubmenuPage(submenuExpanded.entry, config, filterString, submenuSelection);
+        client.showMenu(currentRoot);
+      }
+    }
+  }
+
+  /**
+   * Ctrl+Enter — spawn new instance of selected app and refresh menu.
+   */
+  function handleCtrlEnter(client) {
+    let ctrlTarget = null;
+    if (submenuExpanded) {
+      ctrlTarget = submenuExpanded.entry;
+    } else {
+      const filtered = getFiltered(focusedFirstEntries, filterString, fuzzyMode, lastFuzzyItems);
+      ctrlTarget = filtered[mainSelection];
+    }
+    if (ctrlTarget) {
+      const cls = ctrlTarget.data?.class || ctrlTarget.name;
+      const cmd = getLaunchCommand(cls);
+      console.log('→ Ctrl+Enter — spawning %s (%s)', ctrlTarget.name, cmd);
+      exec('nohup ' + cmd + ' > /dev/null 2>&1 &', { detached: true });
+      pollAfterSpawn(client);
+    }
+  }
+
+  /**
+   * Poll after spawning: wait for Kando to lose focus, refocus Kando, then refresh.
+   */
+  function pollAfterSpawn(client) {
+    let kandoAddr = null;
+    try {
+      const aw = JSON.parse(
+        execSync('hyprctl activewindow -j', { timeout: 2000, encoding: 'utf-8' })
+      );
+      kandoAddr = aw.address || null;
+    } catch {}
+    if (kandoAddr) {
+      let attempts = 0;
+      const poll = () => {
+        attempts++;
+        try {
+          const cur = JSON.parse(
+            execSync('hyprctl activewindow -j', { timeout: 2000, encoding: 'utf-8' })
+          );
+          if (cur.address && cur.address !== kandoAddr) {
+            execSync("hyprctl dispatch 'hl.dsp.focus({ last = true })'", { timeout: 2000 });
+            doSpawnRefresh(client);
+            return;
+          }
+        } catch {}
+        if (attempts < 30) setTimeout(poll, 300);
+        else doSpawnRefresh(client);
+      };
+      setTimeout(poll, 500);
+    } else {
+      setTimeout(() => doSpawnRefresh(client), 1500);
+    }
+  }
+
+  function doSpawnRefresh(client) {
+    try {
+      const { newEntries, newFocused } = refreshWindowData(config, focusedClass);
+      focusedFirstEntries = newFocused;
+      allEntries = newEntries;
+    } catch {}
+    if (submenuExpanded) {
+      let entry = allEntries.find(e =>
+        e.data?.class && e.data.class.toLowerCase() ===
+          (submenuExpanded.overflowClass || '').toLowerCase()
+      );
+      if (entry && submenuExpanded.overflowDepth > 0) {
+        for (let d = 0; d < submenuExpanded.overflowDepth; d++) {
+          const addSvg = (entry.children || []).find(c => c.type === 'submenu' && c.icon === 'add.svg');
+          if (addSvg) entry = addSvg; else break;
+        }
+      }
+      if (entry) {
+        submenuExpanded.entry = entry;
+        currentRoot = buildSubmenuPage(entry, config, filterString, submenuSelection);
+        client.showMenu(currentRoot);
+      }
+    } else {
+      currentRoot = sendCurrentPage(client);
+    }
+  }
+
+  /**
+   * Handle fuzzy search inside a submenu.
+   */
+  function handleFuzzySubmenu(client) {
+    const useFuzzy = runFuzzySearch(filterString, config, focusedFirstEntries, submenuExpanded);
+    lastFuzzyItems = useFuzzy;
+    if (useFuzzy) {
+      console.log('  Submenu fuzzy debug: %d raw for "%s":', useFuzzy.length, filterString);
+      useFuzzy.slice(0, 10).forEach(f =>
+        console.log('    text="%s" name="%s"', f.text.substring(0, 50),
+          (f.entry?.name || '').substring(0, 40)));
+    }
+    const filtered = getFiltered(focusedFirstEntries, filterString, fuzzyMode, useFuzzy);
+    const rootName = filterString;
+    const count = filtered.length;
+    console.log('  Fuzzy in submenu: %d item(s) for "%s"', count, filterString);
+    if (count === 0) {
+      client.showMenu({
+        type: 'simple-button', name: rootName, icon: 'gps_fixed',
+        iconTheme: 'material-symbols-rounded', children: undefined,
+      });
+      return;
+    }
+    const root = buildPaginatedRootWithName(filtered, config, mainSelection, rootName, config.maxItems);
+    client.showMenu(root);
+  }
 }
+
 main().catch((err) => { console.error('Unhandled error:', err); process.exit(1); });
