@@ -2,19 +2,18 @@
 
 > *A fast, fuzzy-filtered window-switching pie menu for Hyprland, powered by [Kando](https://github.com/kando-menu/kando).*
 
-<video src="rec_20260528_144534.webm" controls width="100%" muted>
-  Your browser does not support the video tag.
-</video>
-
+## TODO
+- Remove all ALT+<number> bindings as numkeys are now treated as quickselect keys
+- Add functionality to scrape the xdg desktop directory and allow for fast filter access to all desktop apps in the users system
 ---
 
-## ⚠️ This repo depends on **two things** and **two things only**:
+## ⚠️ This repo depends on hyprland and kando
 
 1. **[Kando](https://github.com/kando-menu/kando)** — the pie menu renderer. KAATWS connects to Kando's IPC WebSocket server, sends it a dynamic menu tree built from your running windows, and listens for selection/cancel events. **Without Kando, there is no pie menu.** Full stop.
 
 2. **[Hyprland](https://hyprland.org/)** — the Wayland compositor. KAATWS talks to Hyprland via `hyprctl` to enumerate windows (`hyprctl clients -j`), detect the currently focused app (`hyprctl activewindow -j`), and focus specific windows (`hyprctl dispatch`). **Without Hyprland, there are no windows to switch between.** Full stop.
 
-These are **hard dependencies**. This is not a general-purpose window switcher. This is a Kando pie menu that queries Hyprland's state. They are joined at the hip. If you don't run Hyprland with Kando installed, this repo is not for you.
+These are **hard dependencies**. This is not a general-purpose window switcher. This is a Kando pie menu that queries Hyprland's state.
 
 ---
 

@@ -174,7 +174,7 @@ function buildPaginatedRoot(allEntries, currentPage, config, filterString, mainS
   let displayEntries = getFiltered(allEntries, filterString);
 
   if (displayEntries.length === 0) {
-    return { type: 'simple-button', name: '>', icon: 'gps_fixed', iconTheme: 'material-symbols-rounded', children: undefined };
+    return { type: 'simple-button', name: '>', icon: 'arrow_' + (mainSelection + 1) + '.svg', iconTheme: config.iconTheme, children: undefined };
   }
 
   // Compute center text: show selected item's name
@@ -216,13 +216,13 @@ function buildPaginatedRoot(allEntries, currentPage, config, filterString, mainS
       children: overflowChildren,
     });
     return {
-      type: 'simple-button', name: rootName, icon: 'gps_fixed', iconTheme: 'material-symbols-rounded',
+      type: 'simple-button', name: rootName, icon: 'arrow_' + (mainSelection + 1) + '.svg', iconTheme: config.iconTheme,
       children: assignAngles(pageItems, maxItems),
     };
   }
 
   return {
-    type: 'simple-button', name: rootName, icon: 'gps_fixed', iconTheme: 'material-symbols-rounded',
+    type: 'simple-button', name: rootName, icon: 'arrow_' + (mainSelection + 1) + '.svg', iconTheme: config.iconTheme,
     children: assignAngles([...marked], maxItems),
   };
 }
@@ -240,7 +240,7 @@ function buildSubmenuPage(submenuEntry, config, filterString, selection) {
   const selName = children[selection]?.name || '';
   const center = truncate(selName, 35) + '  (' + (selection + 1) + '/' + children.length + ')';
   return {
-    type: 'simple-button', name: center, icon: 'left_arrow.svg', iconTheme: config.iconTheme,
+    type: 'simple-button', name: center, icon: 'arrow_' + (selection + 1) + '.svg', iconTheme: config.iconTheme,
     children: assignAngles(children, maxItems),
   };
 }
@@ -386,6 +386,42 @@ async function main() {
       if (submenuExpanded) { submenuExpanded = null; submenuSelection = 0; filterString = ''; mainSelection = 0; menuChanged = true; }
     } else if (ev.name === 'BACKSPACE') {
       if (filterString.length > 0) { filterString = filterString.slice(0, -1); mainSelection = 0; menuChanged = true; }
+    } else if (ev.name === 'c') {
+      if (!ev.ctrl) { filterString += 'c'; mainSelection = 0; menuChanged = true; }
+      else {
+      // Ctrl+C — close the selected window and regenerate menu
+      let target = null;
+      if (submenuExpanded) {
+        target = (submenuExpanded.entry.children || [])[submenuSelection];
+      } else {
+        const filtered = getFiltered(focusedFirstEntries, filterString);
+        target = filtered[mainSelection];
+      }
+      if (target && target.data?.action === 'focus' && target.data?.address) {
+        try {
+          execSync("hyprctl dispatch 'hl.dsp.window.close({ window = \"address:" + target.data.address + "\" })'", { timeout: 3000 });
+          console.log('→ Closed %s', target.name);
+        } catch (err) { console.error('✖ Close failed:', err.message); }
+        // Regenerate the menu (same selection index)
+        if (submenuExpanded) {
+          submenuExpanded.entry.children = (submenuExpanded.entry.children || []).filter(
+            c => c.data?.address !== target.data?.address
+          );
+          currentRoot = buildSubmenuPage(submenuExpanded.entry, config, filterString, Math.min(submenuSelection, (submenuExpanded.entry.children?.length || 1) - 1));
+          client.showMenu(currentRoot);
+        } else {
+          // Remove the closed item from the data and regenerate
+          const closedAddr = target.data.address;
+          focusedFirstEntries = focusedFirstEntries.filter(e => e.data?.address !== closedAddr);
+          mainSelection = Math.min(mainSelection, focusedFirstEntries.length - 1);
+          if (focusedFirstEntries.length > 0) {
+            currentRoot = sendCurrentPage(client);
+          } else {
+            currentRoot = sendCurrentPage(client);
+          }
+        }
+      }
+      }
     } else if (ev.character && /^[1-6]$/.test(ev.character)) {
       // 1..6 — select item at position (ALT isn't detected because ALT events
       // don't reach the keyd virtual keyboard). Must come BEFORE letter key filter.
