@@ -7,20 +7,23 @@
     },
     {
       "name": "com.mitchellh.ghostty",
-      "command": "com.mitchellh.ghostty"
+      "command": "ghostty"
     },
     {
-      "name": "blender",
-      "command": "blender"
+      "name": "sioyek",
+      "command": "sioyek"
     },
     {
       "name": "discord",
       "command": "discord"
     }
   ],
-  "hiddenWindows": [],
+  "hiddenWindows": [
+    { "class": "electron", "title": "Kando Menu" }
+  ],
   "iconTheme": "fireshark",
   "iconThemeDirectory": "/home/fireshark/.config/kando/icon-themes",
+  "fuzzySearch": true,
   "maxItems": 6,
   "submenuThreshold": 2,
   "truncationLimit": 30

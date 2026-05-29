@@ -8,6 +8,7 @@
     "start": "node kaatws.js"
   },
   "dependencies": {
+    "fuse.js": "^7.3.0",
     "ws": "^8.20.0"
   },
   "author": "",
